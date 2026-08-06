@@ -1,0 +1,111 @@
+# Copilot instructions for `burberry`
+
+`burberry` is a Rust library crate — a fork of [paradigmxyz/artemis](https://github.com/paradigmxyz/artemis/)
+providing an event-driven engine for MEV/blockchain bots. Edition 2021, MSRV 1.76.
+
+## Build / test / lint
+
+```bash
+cargo build --all-features
+cargo clippy --all-features --all-targets -- -D warnings
+cargo fmt --all --check
+
+# Feature combinations matter:
+cargo check --all-features                            # OK
+cargo check --no-default-features --features ethereum # OK
+cargo check --no-default-features                     # BROKEN (see below)
+cargo check --no-default-features --features telegram # BROKEN (see below)
+
+# Examples are the de-facto integration tests (they hit live RPC endpoints):
+cargo run --example subscribe_mempool
+cargo run --example map
+
+cargo test --all-features            # full suite
+cargo test broadcast_does_not_deep_clone_payloads   # single test
+cargo test -- --nocapture            # show println!/tracing output
+```
+
+Known pre-existing breakage (don't be surprised, and don't let new code add to it):
+`--no-default-features` fails because `src/collector`/`src/executor` re-exports assume the
+`ethereum` feature, and `telegram`-only fails because `src/action_submitter/telegram.rs` uses
+`#[tokio::main(flavor = "current_thread")]`, which needs tokio's `macros`/`rt` features that only get
+enabled transitively today.
+
+Tests live in `tests/` (integration style, since everything the engine exposes is public).
+`tests/arc_broadcast.rs` asserts clone counts and will fail if the `Arc` broadcast path regresses.
+
+## Architecture
+
+The whole crate is four traits in `src/types.rs` wired together by `Engine` in `src/engine.rs`:
+
+- `Collector<E>` — produces an async `CollectorStream<'_, E>` of events (blocks, logs, mempool txs, ticks).
+- `Strategy<E, A>` — consumes events as `Arc<E>`, emits actions via an `Arc<dyn ActionSubmitter<A>>`.
+  `sync_state` runs once before the event loop starts; a failure there aborts `Engine::run`.
+- `ActionSubmitter<A>` — fire-and-forget action sink taking an owned `A`; **`submit` is sync and
+  returns nothing**, so errors are logged, not propagated.
+- `Executor<A>` — performs the action, receiving `Arc<A>` (send tx, post Telegram message, print).
+
+`Engine::run` builds two `tokio::sync::broadcast` channels (event and action, both capacity 512 by
+default, tunable via `with_event_channel_capacity` / `with_action_channel_capacity`) and spawns every
+collector, strategy, and executor into a `JoinSet`. Consequences to keep in mind:
+
+- Broadcast means **every strategy sees every event and every executor sees every action** — routing
+  is done by the `ExecutorMap`/`CollectorMap` adapters, not by the channels.
+- **Payloads are broadcast as `Arc<E>` / `Arc<A>`.** tokio's broadcast clones the value once per
+  receiver, so sending `E`/`A` directly would deep-clone a full `Block` (hundreds of KB) once per
+  strategy. The engine wraps each payload in an `Arc` exactly once; additional subscribers only cost
+  a refcount bump. This is why `E` and `A` are **not** required to be `Clone` (`A` must still be
+  `Debug` for logging). `tests/arc_broadcast.rs` guards this with clone counters — keep it passing.
+- Slow consumers get `RecvError::Lagged`, which is logged as a warning and the events are dropped.
+- `run` returns an error if any of collectors / strategies / executors is empty.
+- Loops never terminate on their own; `run_and_join` only returns when tasks panic or channels close.
+
+### The map/adapter pattern
+
+The typical bot defines one `Event` enum and one `Action` enum, then wraps single-purpose
+collectors/executors so they fit those enums:
+
+- `CollectorMap<E1, E2>` — `E1 -> E2` (used to wrap a concrete event into an enum variant).
+- `CollectorFilterMap` — `E1 -> Option<E2>`.
+- `ExecutorMap<A2, F>` — `F: Fn(&A1) -> Option<A2>`; **the closure borrows the action** so that an
+  executor which doesn't handle this variant costs nothing. `None` means "not my variant", skipped.
+- `ActionSubmitterMap` — same idea on the submit side (takes an owned `A1`).
+
+The macros in `src/macros.rs` are the intended way to build these and take an enum *variant path*
+as the second argument:
+
+```rust
+engine.add_collector(map_collector!(MempoolCollector::new(provider), Event::Transaction));
+engine.add_executor(map_executor!(EchoExecutor::default(), Action::EchoBlock));
+submit_action!(submitter, Action::EchoBlock, block.number);
+```
+
+Use `map_boxed_collector!` / `map_boxed_executor!` when you already hold a `Box<dyn ...>`.
+
+`map_executor!` expands to `match action { Variant(value) => Some(value.clone()), _ => None }`
+against a `&A`, so **action variant payloads must be `Clone`, and large ones should be wrapped in
+`Arc`** (e.g. `Action::Submit(Arc<TransactionRequest>)`) — that clone is the one remaining copy on
+the hot path.
+
+## Conventions
+
+- **Cargo features gate whole modules.** `ethereum` (alloy + thiserror) and `telegram`
+  (reqwest + serde_json) are both on by default. Any new alloy- or reqwest-dependent file must be
+  declared *and* re-exported behind `#[cfg(feature = "...")]` in the parent `mod.rs`
+  (see `src/collector/mod.rs`, `src/executor/mod.rs`, `src/action_submitter/mod.rs`). Feature-optional
+  dependencies use `optional = true` + `dep:` syntax in `Cargo.toml`.
+- **Public API is flat**: `src/lib.rs` re-exports `types::*`, `Engine`, and `async_trait`. Downstream
+  code writes `burberry::{Strategy, Engine, async_trait}`; new core types belong in `types.rs`.
+- **Trait impls use `#[async_trait]`** and override `fn name(&self) -> &str` with the struct's own
+  name — the engine logs it via `tracing` (`name = collector.name()`), so an unnamed component shows
+  up as `"Unnamed"`.
+- **Errors:** `eyre::Result` everywhere in trait signatures; use `.wrap_err("...")` for context.
+  `thiserror` is only used for the ethereum-specific error types.
+- **Streams** are built with `async_stream::stream! { loop { ... yield ... } }` and returned as
+  `Box::pin(stream)`; see `src/collector/interval_collector.rs` for the minimal template.
+- **Alloy providers** are passed around as `Arc<dyn Provider<_>>` and cloned with `Arc::clone`.
+  Alloy is pinned to major version 1 — its API changes frequently across versions, so match the
+  existing call style (`ProviderBuilder::new().connect_ws(ws)`).
+- **Builder pattern** for config-heavy structs with many optionals (`MessageBuilder` in
+  `src/executor/telegram_message.rs`): `Option<T>` fields, `fn x<T: Into<String>>(mut self, ..) -> Self`.
+- `Cargo.lock` is gitignored — this is a library; don't commit it.
