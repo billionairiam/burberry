@@ -1,4 +1,4 @@
-use std::{fmt::Debug, sync::Arc};
+use std::{fmt::Debug, sync::Arc, time::Duration};
 
 use crate::{
     action_submitter::ActionChannelSubmitter,
@@ -8,6 +8,7 @@ use eyre::Context;
 use futures::StreamExt;
 use tokio::{
     sync::broadcast::{self, error::RecvError, Sender},
+    sync::Semaphore,
     task::JoinSet,
 };
 use tracing::{debug, error, warn};
@@ -19,6 +20,9 @@ pub struct Engine<E, A> {
 
     event_channel_capacity: usize,
     action_channel_capacity: usize,
+
+    executor_concurrency: usize,
+    executor_timeout: Option<Duration>,
 }
 
 impl<E, A> Engine<E, A> {
@@ -29,6 +33,8 @@ impl<E, A> Engine<E, A> {
             executors: vec![],
             event_channel_capacity: 512,
             action_channel_capacity: 512,
+            executor_concurrency: 1,
+            executor_timeout: None,
         }
     }
 
@@ -39,6 +45,34 @@ impl<E, A> Engine<E, A> {
 
     pub fn with_action_channel_capacity(mut self, capacity: usize) -> Self {
         self.action_channel_capacity = capacity;
+        self
+    }
+
+    /// Maximum number of actions a single executor may process at the same time.
+    ///
+    /// Defaults to `1`, meaning each executor handles actions strictly one after another. With the
+    /// default, a slow action (a hanging HTTP request, say) blocks every later action for that
+    /// executor, which in turn makes the action channel lag and silently drop actions.
+    ///
+    /// Raising this spawns each action on its own task, bounded by a semaphore. Only do this for
+    /// executors that are safe to run out of order — [`crate::executor::transaction::TransactionSender`]
+    /// is *not*, since it assigns nonces sequentially.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `concurrency` is 0.
+    pub fn with_executor_concurrency(mut self, concurrency: usize) -> Self {
+        assert!(concurrency > 0, "executor concurrency must be at least 1");
+        self.executor_concurrency = concurrency;
+        self
+    }
+
+    /// Abort an action if its executor has not finished within `timeout`.
+    ///
+    /// Defaults to no timeout, in which case a request that never completes wedges the executor
+    /// forever. The timed-out action is logged and dropped.
+    pub fn with_executor_timeout(mut self, timeout: Duration) -> Self {
+        self.executor_timeout = Some(timeout);
         self
     }
 
@@ -111,16 +145,31 @@ where
         // Spawn executors in separate threads.
         for executor in self.executors {
             let mut receiver = action_sender.subscribe();
+            let executor: Arc<dyn Executor<A>> = Arc::from(executor);
+            let timeout = self.executor_timeout;
+            let semaphore = (self.executor_concurrency > 1)
+                .then(|| Arc::new(Semaphore::new(self.executor_concurrency)));
 
             set.spawn(async move {
                 debug!(name = executor.name(), "starting executor... ");
 
                 loop {
                     match receiver.recv().await {
-                        Ok(action) => match executor.execute(action).await {
-                            Ok(_) => {}
-                            Err(e) => {
-                                error!(name = executor.name(), "error executing action: {}", e)
+                        Ok(action) => match &semaphore {
+                            // Serial: a slow action delays the next one, but ordering is
+                            // preserved for executors that depend on it (nonce assignment).
+                            None => execute_action(executor.as_ref(), action, timeout).await,
+                            Some(semaphore) => {
+                                let permit = match Arc::clone(semaphore).acquire_owned().await {
+                                    Ok(permit) => permit,
+                                    Err(_) => break,
+                                };
+                                let executor = Arc::clone(&executor);
+
+                                tokio::spawn(async move {
+                                    let _permit = permit;
+                                    execute_action(executor.as_ref(), action, timeout).await;
+                                });
                             }
                         },
                         Err(RecvError::Closed) => {
@@ -188,5 +237,28 @@ where
         }
 
         Ok(set)
+    }
+}
+
+async fn execute_action<A>(executor: &dyn Executor<A>, action: Arc<A>, timeout: Option<Duration>)
+where
+    A: Send + Sync + 'static,
+{
+    let result = match timeout {
+        Some(timeout) => match tokio::time::timeout(timeout, executor.execute(action)).await {
+            Ok(result) => result,
+            Err(_) => {
+                error!(
+                    name = executor.name(),
+                    "action timed out after {timeout:?}, dropping it"
+                );
+                return;
+            }
+        },
+        None => executor.execute(action).await,
+    };
+
+    if let Err(e) = result {
+        error!(name = executor.name(), "error executing action: {e:#}");
     }
 }

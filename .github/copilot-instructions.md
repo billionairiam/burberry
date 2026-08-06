@@ -10,11 +10,11 @@ cargo build --all-features
 cargo clippy --all-features --all-targets -- -D warnings
 cargo fmt --all --check
 
-# Feature combinations matter:
-cargo check --all-features                            # OK
-cargo check --no-default-features --features ethereum # OK
-cargo check --no-default-features                     # BROKEN (see below)
-cargo check --no-default-features --features telegram # BROKEN (see below)
+# Feature combinations (all verified working):
+cargo check --all-features
+cargo check --no-default-features
+cargo check --no-default-features --features ethereum
+cargo check --no-default-features --features telegram
 
 # Examples are the de-facto integration tests (they hit live RPC endpoints):
 cargo run --example subscribe_mempool
@@ -25,14 +25,10 @@ cargo test broadcast_does_not_deep_clone_payloads   # single test
 cargo test -- --nocapture            # show println!/tracing output
 ```
 
-Known pre-existing breakage (don't be surprised, and don't let new code add to it):
-`--no-default-features` fails because `src/collector`/`src/executor` re-exports assume the
-`ethereum` feature, and `telegram`-only fails because `src/action_submitter/telegram.rs` uses
-`#[tokio::main(flavor = "current_thread")]`, which needs tokio's `macros`/`rt` features that only get
-enabled transitively today.
-
 Tests live in `tests/` (integration style, since everything the engine exposes is public).
 `tests/arc_broadcast.rs` asserts clone counts and will fail if the `Arc` broadcast path regresses.
+`tests/executor_runtime.rs` covers executor concurrency and timeouts; it is timing-based, so keep
+its sleep margins generous.
 
 ## Architecture
 
@@ -57,6 +53,11 @@ collector, strategy, and executor into a `JoinSet`. Consequences to keep in mind
   a refcount bump. This is why `E` and `A` are **not** required to be `Clone` (`A` must still be
   `Debug` for logging). `tests/arc_broadcast.rs` guards this with clone counters — keep it passing.
 - Slow consumers get `RecvError::Lagged`, which is logged as a warning and the events are dropped.
+- **Executors are serial by default** — one action at a time, waiting forever. That default is
+  deliberate: `TransactionSender` assigns nonces sequentially and breaks if actions interleave.
+  Opt into `with_executor_concurrency(n)` (semaphore-bounded `tokio::spawn` per action) and
+  `with_executor_timeout(d)` only for executors that tolerate it. A hanging action with neither
+  set will wedge that executor and make the action channel lag.
 - `run` returns an error if any of collectors / strategies / executors is empty.
 - Loops never terminate on their own; `run_and_join` only returns when tasks panic or channels close.
 
@@ -93,7 +94,12 @@ the hot path.
   (reqwest + serde_json) are both on by default. Any new alloy- or reqwest-dependent file must be
   declared *and* re-exported behind `#[cfg(feature = "...")]` in the parent `mod.rs`
   (see `src/collector/mod.rs`, `src/executor/mod.rs`, `src/action_submitter/mod.rs`). Feature-optional
-  dependencies use `optional = true` + `dep:` syntax in `Cargo.toml`.
+  dependencies use `optional = true` + `dep:` syntax in `Cargo.toml`. Always verify with
+  `--no-default-features`: the crate must not rely on features that only arrive transitively via
+  alloy or reqwest (tokio's `sync`/`time`/`macros` are declared explicitly for exactly this reason).
+- **Outbound HTTP clients must set timeouts.** `TelegramMessageDispatcher` configures
+  `timeout` / `connect_timeout` / `pool_idle_timeout`; a client without them can hang an executor
+  indefinitely.
 - **Public API is flat**: `src/lib.rs` re-exports `types::*`, `Engine`, and `async_trait`. Downstream
   code writes `burberry::{Strategy, Engine, async_trait}`; new core types belong in `types.rs`.
 - **Trait impls use `#[async_trait]`** and override `fn name(&self) -> &str` with the struct's own

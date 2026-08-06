@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::time::Duration;
 
 use async_trait::async_trait;
 use reqwest::{Response, StatusCode};
@@ -107,7 +108,13 @@ impl TelegramMessageDispatcher {
             error_report_bot_token,
             error_report_chat_id,
             error_report_thread_id,
-            client: reqwest::ClientBuilder::new().build().unwrap(),
+            client: reqwest::ClientBuilder::new()
+                // Without these, a stalled Telegram request blocks the executor forever.
+                .timeout(Duration::from_secs(30))
+                .connect_timeout(Duration::from_secs(10))
+                .pool_idle_timeout(Duration::from_secs(90))
+                .build()
+                .unwrap(),
         }
     }
 
