@@ -61,6 +61,9 @@ collector, strategy, and executor into a `JoinSet`. Consequences to keep in mind
   `with_executor_timeout(d)` only for executors that tolerate it. A hanging action with neither
   set will wedge that executor and make the action channel lag.
 - `run` returns an error if any of collectors / strategies / executors is empty.
+- **Collectors reconnect.** A failed `get_event_stream` or an ended stream is retried every
+  `with_collector_retry_interval` (1s default) rather than killing the task — websocket
+  subscriptions drop routinely and the RPC endpoint is often not up yet at boot.
 - Loops never terminate on their own; `run_and_join` only returns when tasks panic or channels close.
 
 ### The map/adapter pattern
@@ -99,9 +102,14 @@ the hot path.
   dependencies use `optional = true` + `dep:` syntax in `Cargo.toml`. Always verify with
   `--no-default-features`: the crate must not rely on features that only arrive transitively via
   alloy or reqwest (tokio's `sync`/`time`/`macros` are declared explicitly for exactly this reason).
+- **`ActionSubmitter::submit` must never block.** It is sync and runs inside the strategy's event
+  loop, so anything slow has to be handed to a background worker. `TelegramSubmitter` pushes onto a
+  bounded `mpsc` queue drained by one dedicated thread with its own runtime, and drops messages with
+  an error when the queue is full rather than growing without bound.
 - **Outbound HTTP clients must set timeouts.** `TelegramMessageDispatcher` configures
   `timeout` / `connect_timeout` / `pool_idle_timeout`; a client without them can hang an executor
-  indefinitely.
+  indefinitely. Its `with_base_url` exists so tests can point at a local socket instead of
+  `api.telegram.org` — keep network-touching tests offline that way.
 - **Public API is flat**: `src/lib.rs` re-exports `types::*`, `Engine`, and `async_trait`. Downstream
   code writes `burberry::{Strategy, Engine, async_trait}`; new core types belong in `types.rs`.
 - **Trait impls use `#[async_trait]`** and override `fn name(&self) -> &str` with the struct's own
