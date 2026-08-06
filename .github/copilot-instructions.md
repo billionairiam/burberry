@@ -115,6 +115,11 @@ the hot path.
   tick and only pulls the full block when the height advanced — a full mainnet block is megabytes,
   so fetching it on every tick wastes bandwidth and RPC quota. A block that isn't indexed yet must
   not advance the cursor, so the next tick retries it.
+- **Per-block retries must be bounded.** `FullBlockCollector` retries the body fetch (nodes announce
+  a header slightly before they can serve the body) but gives up after `max_retries`. Retrying is
+  serial by design — block order matters — so an unbounded retry would stall the stream while new
+  headers pile up in the subscription buffer and get dropped. A miss logs at `debug` (it's routine),
+  an RPC error at `warn`, and only giving up logs at `error`.
 - **Alloy providers** are passed around as `Arc<dyn Provider<_>>` and cloned with `Arc::clone`.
   Alloy is pinned to major version 1 — its API changes frequently across versions, so match the
   existing call style (`ProviderBuilder::new().connect_ws(ws)`).
