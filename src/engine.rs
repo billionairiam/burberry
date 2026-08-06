@@ -23,6 +23,7 @@ pub struct Engine<E, A> {
 
     executor_concurrency: usize,
     executor_timeout: Option<Duration>,
+    collector_retry_interval: Duration,
 }
 
 impl<E, A> Engine<E, A> {
@@ -35,6 +36,7 @@ impl<E, A> Engine<E, A> {
             action_channel_capacity: 512,
             executor_concurrency: 1,
             executor_timeout: None,
+            collector_retry_interval: Duration::from_secs(1),
         }
     }
 
@@ -73,6 +75,14 @@ impl<E, A> Engine<E, A> {
     /// forever. The timed-out action is logged and dropped.
     pub fn with_executor_timeout(mut self, timeout: Duration) -> Self {
         self.executor_timeout = Some(timeout);
+        self
+    }
+
+    /// How long to wait before reconnecting a collector whose stream failed or ended.
+    ///
+    /// Defaults to one second.
+    pub fn with_collector_retry_interval(mut self, interval: Duration) -> Self {
+        self.collector_retry_interval = interval;
         self
     }
 
@@ -221,18 +231,38 @@ where
         // Spawn collectors in separate threads.
         for collector in self.collectors {
             let event_sender = event_sender.clone();
+            let retry_interval = self.collector_retry_interval;
 
             set.spawn(async move {
                 debug!(name = collector.name(), "starting collector... ");
-                let mut event_stream = collector.get_event_stream().await.unwrap();
 
-                while let Some(event) = event_stream.next().await {
-                    if let Err(e) = event_sender.send(Arc::new(event)) {
-                        error!(name = collector.name(), "error sending event: {e:#}");
+                // Websocket subscriptions drop routinely, and an RPC endpoint is often not
+                // reachable at the exact moment the bot starts, so neither a failure to
+                // subscribe nor an ended stream may take the collector down for good.
+                loop {
+                    match collector.get_event_stream().await {
+                        Ok(mut event_stream) => {
+                            while let Some(event) = event_stream.next().await {
+                                if let Err(e) = event_sender.send(Arc::new(event)) {
+                                    error!(name = collector.name(), "error sending event: {e:#}");
+                                }
+                            }
+
+                            error!(
+                                name = collector.name(),
+                                "event stream ended, reconnecting in {retry_interval:?}"
+                            );
+                        }
+                        Err(e) => {
+                            error!(
+                                name = collector.name(),
+                                "fail to get event stream, retrying in {retry_interval:?}: {e:#}"
+                            );
+                        }
                     }
-                }
 
-                error!(name = collector.name(), "event stream ended!");
+                    tokio::time::sleep(retry_interval).await;
+                }
             });
         }
 

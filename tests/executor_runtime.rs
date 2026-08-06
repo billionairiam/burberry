@@ -121,3 +121,66 @@ async fn executor_timeout_unblocks_later_actions() {
         "the hanging action should be dropped, letting the next one through"
     );
 }
+
+mod reconnect {
+    use super::*;
+    use std::sync::atomic::AtomicUsize;
+
+    static ATTEMPTS: AtomicUsize = AtomicUsize::new(0);
+    static DELIVERED: AtomicUsize = AtomicUsize::new(0);
+
+    /// Fails to subscribe on the first attempt, then yields one event per attempt and ends the
+    /// stream -- the shape of a websocket that drops and has to be re-subscribed.
+    struct FlakyCollector;
+
+    #[async_trait]
+    impl Collector<Event> for FlakyCollector {
+        async fn get_event_stream(&self) -> eyre::Result<CollectorStream<'_, Event>> {
+            if ATTEMPTS.fetch_add(1, Ordering::SeqCst) == 0 {
+                eyre::bail!("connection refused");
+            }
+
+            Ok(Box::pin(futures::stream::once(async { Event })))
+        }
+    }
+
+    struct CountingStrategy;
+
+    #[async_trait]
+    impl Strategy<Event, Action> for CountingStrategy {
+        async fn process_event(
+            &mut self,
+            _event: Arc<Event>,
+            _submitter: Arc<dyn ActionSubmitter<Action>>,
+        ) {
+            DELIVERED.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    #[tokio::test]
+    async fn collectors_reconnect_instead_of_panicking() {
+        let mut engine: Engine<Event, Action> =
+            Engine::new().with_collector_retry_interval(Duration::from_millis(20));
+        engine.add_collector(Box::new(FlakyCollector));
+        engine.add_strategy(Box::new(CountingStrategy));
+        engine.add_executor(Box::new(SleepExecutor(&IGNORED)));
+
+        let _set = engine.run().await.expect("engine should start");
+
+        tokio::time::sleep(Duration::from_millis(300)).await;
+
+        // The old code unwrapped the first error and killed the task for good.
+        assert!(
+            ATTEMPTS.load(Ordering::SeqCst) > 2,
+            "collector should keep re-subscribing, got {} attempts",
+            ATTEMPTS.load(Ordering::SeqCst)
+        );
+        assert!(
+            DELIVERED.load(Ordering::SeqCst) > 1,
+            "events should keep flowing after a reconnect, got {}",
+            DELIVERED.load(Ordering::SeqCst)
+        );
+    }
+
+    static IGNORED: AtomicUsize = AtomicUsize::new(0);
+}
