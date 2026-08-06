@@ -25,10 +25,12 @@ cargo test broadcast_does_not_deep_clone_payloads   # single test
 cargo test -- --nocapture            # show println!/tracing output
 ```
 
-Tests live in `tests/` (integration style, since everything the engine exposes is public).
-`tests/arc_broadcast.rs` asserts clone counts and will fail if the `Arc` broadcast path regresses.
-`tests/executor_runtime.rs` covers executor concurrency and timeouts; it is timing-based, so keep
-its sleep margins generous.
+Tests live in `tests/` (integration style) plus `#[cfg(test)]` modules for anything needing the
+crate's optional dependencies (alloy's `Asserter` mock transport is only reachable from inside the
+crate). `tests/arc_broadcast.rs` asserts clone counts and will fail if the `Arc` broadcast path
+regresses. `tests/executor_runtime.rs` covers executor concurrency and timeouts; it is timing-based,
+so keep its sleep margins generous. `poll_full_block_collector`'s tests drive a FIFO mock queue, so
+an unexpected extra RPC call desyncs the queue and trips the 2s timeout.
 
 ## Architecture
 
@@ -109,6 +111,10 @@ the hot path.
   `thiserror` is only used for the ethereum-specific error types.
 - **Streams** are built with `async_stream::stream! { loop { ... yield ... } }` and returned as
   `Box::pin(stream)`; see `src/collector/interval_collector.rs` for the minimal template.
+- **Polling collectors probe cheaply first.** `PollFullBlockCollector` calls `eth_blockNumber` each
+  tick and only pulls the full block when the height advanced — a full mainnet block is megabytes,
+  so fetching it on every tick wastes bandwidth and RPC quota. A block that isn't indexed yet must
+  not advance the cursor, so the next tick retries it.
 - **Alloy providers** are passed around as `Arc<dyn Provider<_>>` and cloned with `Arc::clone`.
   Alloy is pinned to major version 1 — its API changes frequently across versions, so match the
   existing call style (`ProviderBuilder::new().connect_ws(ws)`).
