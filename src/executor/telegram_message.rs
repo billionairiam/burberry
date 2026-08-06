@@ -90,11 +90,14 @@ impl MessageBuilder {
     }
 }
 
+const TELEGRAM_API_BASE_URL: &str = "https://api.telegram.org";
+
 pub struct TelegramMessageDispatcher {
     error_report_bot_token: Option<String>,
     error_report_chat_id: Option<String>,
     error_report_thread_id: Option<String>,
 
+    base_url: String,
     client: reqwest::Client,
 }
 
@@ -108,6 +111,7 @@ impl TelegramMessageDispatcher {
             error_report_bot_token,
             error_report_chat_id,
             error_report_thread_id,
+            base_url: TELEGRAM_API_BASE_URL.to_string(),
             client: reqwest::ClientBuilder::new()
                 // Without these, a stalled Telegram request blocks the executor forever.
                 .timeout(Duration::from_secs(30))
@@ -122,12 +126,19 @@ impl TelegramMessageDispatcher {
         Self::new(None, None, None)
     }
 
-    fn get_url<T: std::fmt::Display>(bot_token: T) -> String {
-        format!("https://api.telegram.org/bot{}/sendMessage", bot_token)
+    /// Point the dispatcher at something other than `https://api.telegram.org`, such as a local
+    /// Bot API server or a proxy.
+    pub fn with_base_url<T: Into<String>>(mut self, base_url: T) -> Self {
+        self.base_url = base_url.into();
+        self
+    }
+
+    fn get_url<T: std::fmt::Display>(&self, bot_token: T) -> String {
+        format!("{}/bot{}/sendMessage", self.base_url, bot_token)
     }
 
     pub async fn send_message(&self, message: &Message) {
-        let url = Self::get_url(&message.bot_token);
+        let url = self.get_url(&message.bot_token);
 
         let mut data = Map::new();
 
@@ -184,7 +195,7 @@ impl TelegramMessageDispatcher {
             }
         };
 
-        let url = Self::get_url(error_report_bot_token);
+        let url = self.get_url(error_report_bot_token);
 
         let mut data = Map::new();
 
