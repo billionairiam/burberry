@@ -1,7 +1,6 @@
 use std::sync::Arc;
 
 use alloy::{
-    primitives::BlockHash,
     providers::Provider,
     rpc::types::{
         eth::{Filter, Log},
@@ -22,21 +21,6 @@ impl LogsInBlockCollector {
     pub fn new(provider: Arc<dyn Provider>, filter: Filter) -> Self {
         Self { provider, filter }
     }
-
-    async fn block_to_logs(&self, block_hash: BlockHash) -> Option<Vec<Log>> {
-        let logs = self
-            .provider
-            .get_logs(&self.filter.clone().at_block_hash(block_hash))
-            .await;
-
-        match logs {
-            Ok(logs) => Some(logs),
-            Err(e) => {
-                tracing::error!(?block_hash, "fail to get logs: {e:#}");
-                None
-            }
-        }
-    }
 }
 
 #[async_trait]
@@ -48,14 +32,24 @@ impl Collector<(Header, Vec<Log>)> for LogsInBlockCollector {
     async fn get_event_stream(&self) -> eyre::Result<CollectorStream<'_, (Header, Vec<Log>)>> {
         let mut stream = self.provider.subscribe_blocks().await?.into_stream();
 
+        // Cloned once for the life of the stream. `at_block_hash` consumes and returns the
+        // filter, so retargeting it per block only overwrites the block selector instead of
+        // copying the address list and topics again.
+        let mut filter = self.filter.clone();
+
         let stream = async_stream::stream! {
-            while let Some(block) = stream.next().await {
-                let logs = match self.block_to_logs(block.hash).await {
-                    Some(logs) => logs,
-                    None => continue,
+            while let Some(header) = stream.next().await {
+                filter = filter.at_block_hash(header.hash);
+
+                let logs = match self.provider.get_logs(&filter).await {
+                    Ok(logs) => logs,
+                    Err(e) => {
+                        tracing::error!(block_hash = ?header.hash, "fail to get logs: {e:#}");
+                        continue;
+                    }
                 };
 
-                yield (block, logs);
+                yield (header, logs);
             }
         };
 

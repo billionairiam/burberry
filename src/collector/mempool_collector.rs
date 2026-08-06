@@ -13,15 +13,32 @@ use std::{
     pin::Pin,
     task::{Context, Poll},
 };
-use tracing::error;
+use tracing::{debug, error};
+
+/// Number of `eth_getTransactionByHash` requests kept in flight while resolving pending hashes.
+const DEFAULT_MAX_CONCURRENT_REQUESTS: usize = 256;
 
 pub struct MempoolCollector {
     provider: Arc<dyn Provider>,
+    max_concurrent_requests: usize,
 }
 
 impl MempoolCollector {
     pub fn new(provider: Arc<dyn Provider>) -> Self {
-        Self { provider }
+        Self {
+            provider,
+            max_concurrent_requests: DEFAULT_MAX_CONCURRENT_REQUESTS,
+        }
+    }
+
+    /// How many transaction bodies to fetch in parallel.
+    ///
+    /// The subscription only carries hashes, so each one needs its own request. Raising this
+    /// drains a busy mempool faster at the cost of more load on the endpoint; lowering it helps
+    /// with providers that rate limit.
+    pub fn with_max_concurrent_requests(mut self, max_concurrent_requests: usize) -> Self {
+        self.max_concurrent_requests = max_concurrent_requests;
+        self
     }
 }
 
@@ -39,8 +56,24 @@ impl Collector<Transaction> for MempoolCollector {
             .wrap_err("fail to subscribe to pending transaction stream")?
             .into_stream();
 
-        let stream = TransactionStream::new(self.provider.as_ref(), stream, 256);
-        let stream = stream.filter_map(|res| async move { res.ok() });
+        let stream =
+            TransactionStream::new(self.provider.as_ref(), stream, self.max_concurrent_requests);
+
+        let stream = stream.filter_map(|res| async move {
+            match res {
+                Ok(tx) => Some(tx),
+                Err(e) => {
+                    match &e {
+                        // A pending hash routinely disappears before its body can be fetched
+                        // because it got mined, replaced or evicted.
+                        GetTransactionError::NotFound(_) => debug!("{e}"),
+                        GetTransactionError::ProviderError(..) => error!("{e}"),
+                    }
+
+                    None
+                }
+            }
+        });
 
         Ok(Box::pin(stream))
     }
