@@ -1,10 +1,13 @@
 #[macro_export]
 macro_rules! map_boxed_executor {
     ($executor: expr, $variant: path) => {
-        Box::new($crate::ExecutorMap::new($executor, |action| match action {
-            $variant(value) => Some(value),
-            _ => None,
-        }))
+        Box::new($crate::ExecutorMap::new(
+            $executor,
+            |action: &_| match action {
+                $variant(value) => Some(value.clone()),
+                _ => None,
+            },
+        ))
     };
 }
 

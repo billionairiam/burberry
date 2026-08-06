@@ -106,8 +106,8 @@ impl Executor<TransactionRequest> for TransactionSender {
         "TransactionSender"
     }
 
-    async fn execute(&self, action: TransactionRequest) -> eyre::Result<()> {
-        let mut action = action;
+    async fn execute(&self, action: Arc<TransactionRequest>) -> eyre::Result<()> {
+        let mut action = (*action).clone();
 
         let account = match action.from {
             Some(v) => v,

@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use async_trait::async_trait;
 use reqwest::{Response, StatusCode};
 use serde_json::{json, Map};
@@ -117,7 +119,7 @@ impl TelegramMessageDispatcher {
         format!("https://api.telegram.org/bot{}/sendMessage", bot_token)
     }
 
-    pub async fn send_message(&self, message: Message) {
+    pub async fn send_message(&self, message: &Message) {
         let url = Self::get_url(&message.bot_token);
 
         let mut data = Map::new();
@@ -166,7 +168,7 @@ impl TelegramMessageDispatcher {
         }
     }
 
-    pub async fn report_error(&self, original_message: Message, error_message: String) {
+    pub async fn report_error(&self, original_message: &Message, error_message: String) {
         let error_report_bot_token = match &self.error_report_bot_token {
             Some(token) => token,
             None => {
@@ -247,10 +249,10 @@ impl Executor<Message> for TelegramMessageDispatcher {
         "TelegramMessageDispatcher"
     }
 
-    async fn execute(&self, action: Message) -> eyre::Result<()> {
+    async fn execute(&self, action: Arc<Message>) -> eyre::Result<()> {
         tracing::debug!("received message: {action:?}");
 
-        self.send_message(action).await;
+        self.send_message(&action).await;
 
         Ok(())
     }

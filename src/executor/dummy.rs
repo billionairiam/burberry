@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use crate::Executor;
 
 pub struct Dummy;
@@ -8,7 +10,7 @@ impl<A: Send + Sync + 'static> Executor<A> for Dummy {
         "Dummy"
     }
 
-    async fn execute(&self, action: A) -> eyre::Result<()> {
+    async fn execute(&self, action: Arc<A>) -> eyre::Result<()> {
         let _ = action;
 
         Ok(())

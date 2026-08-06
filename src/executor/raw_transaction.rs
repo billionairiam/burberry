@@ -53,15 +53,15 @@ impl Executor<Bytes> for RawTransactionSender {
         "RawTransactionSender"
     }
 
-    async fn execute(&self, action: Bytes) -> Result<()> {
-        let send_result = self.provider.send_raw_transaction(&action).await;
+    async fn execute(&self, action: Arc<Bytes>) -> Result<()> {
+        let send_result = self.provider.send_raw_transaction(action.as_ref()).await;
 
         match send_result {
             Ok(tx) => {
                 tracing::info!(tx = ?tx.tx_hash(), "sent tx");
             }
             Err(err) => {
-                let tx_hash = keccak256(&action);
+                let tx_hash = keccak256(action.as_ref());
                 tracing::error!(tx = ?tx_hash, "failed to send tx: {:#}", err);
             }
         }

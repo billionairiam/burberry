@@ -5,6 +5,7 @@ mod printer;
 mod telegram;
 
 use std::fmt::Debug;
+use std::sync::Arc;
 
 pub use map::ActionSubmitterMap;
 pub use printer::ActionPrinter;
@@ -18,21 +19,21 @@ use crate::ActionSubmitter;
 
 #[derive(Clone)]
 pub struct ActionChannelSubmitter<A> {
-    sender: Sender<A>,
+    sender: Sender<Arc<A>>,
 }
 
 impl<A> ActionChannelSubmitter<A> {
-    pub fn new(sender: Sender<A>) -> Self {
+    pub fn new(sender: Sender<Arc<A>>) -> Self {
         Self { sender }
     }
 }
 
 impl<A> ActionSubmitter<A> for ActionChannelSubmitter<A>
 where
-    A: Send + Sync + Clone + Debug + 'static,
+    A: Send + Sync + Debug + 'static,
 {
     fn submit(&self, action: A) {
-        match self.sender.send(action) {
+        match self.sender.send(Arc::new(action)) {
             Ok(_) => (),
             Err(e) => tracing::error!("error submitting action: {:?}", e),
         }

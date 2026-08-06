@@ -59,8 +59,8 @@ impl<E, A> Default for Engine<E, A> {
 
 impl<E, A> Engine<E, A>
 where
-    E: Send + Sync + Clone + 'static,
-    A: Send + Sync + Clone + Debug + 'static,
+    E: Send + Sync + 'static,
+    A: Send + Sync + Debug + 'static,
 {
     pub fn add_collector(&mut self, collector: Box<dyn Collector<E>>) {
         self.collectors.push(collector);
@@ -87,8 +87,12 @@ where
     }
 
     pub async fn run(self) -> Result<JoinSet<()>, Box<dyn std::error::Error>> {
-        let (event_sender, _): (Sender<E>, _) = broadcast::channel(self.event_channel_capacity);
-        let (action_sender, _): (Sender<A>, _) = broadcast::channel(self.action_channel_capacity);
+        // Events and actions are broadcast as `Arc`, so each additional subscriber only pays for
+        // a reference count bump rather than a deep clone of the payload.
+        let (event_sender, _): (Sender<Arc<E>>, _) =
+            broadcast::channel(self.event_channel_capacity);
+        let (action_sender, _): (Sender<Arc<A>>, _) =
+            broadcast::channel(self.action_channel_capacity);
 
         let mut set = JoinSet::new();
 
@@ -174,7 +178,7 @@ where
                 let mut event_stream = collector.get_event_stream().await.unwrap();
 
                 while let Some(event) = event_stream.next().await {
-                    if let Err(e) = event_sender.send(event) {
+                    if let Err(e) = event_sender.send(Arc::new(event)) {
                         error!(name = collector.name(), "error sending event: {e:#}");
                     }
                 }

@@ -46,8 +46,12 @@ pub struct EchoStrategy;
 
 #[async_trait::async_trait]
 impl Strategy<Event, Action> for EchoStrategy {
-    async fn process_event(&mut self, event: Event, submitter: Arc<dyn ActionSubmitter<Action>>) {
-        match event {
+    async fn process_event(
+        &mut self,
+        event: Arc<Event>,
+        submitter: Arc<dyn ActionSubmitter<Action>>,
+    ) {
+        match &*event {
             Event::Block(block) => {
                 submit_action!(submitter, Action::EchoBlock, block.number);
             }
@@ -63,7 +67,7 @@ pub struct EchoExecutor<T>(PhantomData<T>);
 
 #[async_trait::async_trait]
 impl<T: Debug + Send + Sync> Executor<T> for EchoExecutor<T> {
-    async fn execute(&self, action: T) -> eyre::Result<()> {
+    async fn execute(&self, action: Arc<T>) -> eyre::Result<()> {
         println!("action: {:?}", action);
         Ok(())
     }

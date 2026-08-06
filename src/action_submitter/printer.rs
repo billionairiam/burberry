@@ -17,7 +17,7 @@ impl<A> Default for ActionPrinter<A> {
 
 impl<A> ActionSubmitter<A> for ActionPrinter<A>
 where
-    A: Send + Clone + Debug + Sync + 'static,
+    A: Send + Debug + Sync + 'static,
 {
     fn submit(&self, a: A) {
         tracing::info!("action: {a:?}");

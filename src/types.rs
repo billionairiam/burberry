@@ -17,7 +17,7 @@ pub trait Collector<E>: Send + Sync {
 
 pub trait ActionSubmitter<A>: Send + Sync
 where
-    A: Send + Sync + Clone + 'static,
+    A: Send + Sync + 'static,
 {
     fn submit(&self, action: A);
 }
@@ -25,8 +25,8 @@ where
 #[async_trait]
 pub trait Strategy<E, A>: Send + Sync
 where
-    E: Send + Sync + Clone + 'static,
-    A: Send + Sync + Clone + 'static,
+    E: Send + Sync + 'static,
+    A: Send + Sync + 'static,
 {
     fn name(&self) -> &str {
         "Unnamed"
@@ -36,7 +36,9 @@ where
         Ok(())
     }
 
-    async fn process_event(&mut self, event: E, submitter: Arc<dyn ActionSubmitter<A>>);
+    /// Events are delivered as `Arc<E>` so that broadcasting to N strategies costs N reference
+    /// count bumps instead of N deep clones.
+    async fn process_event(&mut self, event: Arc<E>, submitter: Arc<dyn ActionSubmitter<A>>);
 }
 
 pub struct CollectorMap<E, F> {
@@ -111,7 +113,9 @@ pub trait Executor<A>: Send + Sync {
         "Unnamed"
     }
 
-    async fn execute(&self, action: A) -> Result<()>;
+    /// Actions are delivered as `Arc<A>` so that broadcasting to M executors costs M reference
+    /// count bumps instead of M deep clones.
+    async fn execute(&self, action: Arc<A>) -> Result<()>;
 }
 
 pub struct ExecutorMap<A, F> {
@@ -130,16 +134,17 @@ impl<A1, A2, F> Executor<A1> for ExecutorMap<A2, F>
 where
     A1: Send + Sync + 'static,
     A2: Send + Sync + 'static,
-    F: Fn(A1) -> Option<A2> + Send + Sync + Clone + 'static,
+    F: Fn(&A1) -> Option<A2> + Send + Sync + Clone + 'static,
 {
     fn name(&self) -> &str {
         self.inner.name()
     }
 
-    async fn execute(&self, action: A1) -> Result<()> {
-        let action = (self.f)(action);
-        match action {
-            Some(action) => self.inner.execute(action).await,
+    async fn execute(&self, action: Arc<A1>) -> Result<()> {
+        // The mapping function borrows the action, so an executor that does not handle this
+        // variant costs nothing beyond the match itself.
+        match (self.f)(&action) {
+            Some(action) => self.inner.execute(Arc::new(action)).await,
             None => Ok(()),
         }
     }

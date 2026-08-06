@@ -20,8 +20,8 @@ impl<A1, A2, F> ActionSubmitterMap<A1, A2, F> {
 
 impl<A1, A2, F> ActionSubmitter<A1> for ActionSubmitterMap<A1, A2, F>
 where
-    A1: Send + Sync + Clone + Debug + 'static,
-    A2: Send + Sync + Clone + Debug + 'static,
+    A1: Send + Sync + Debug + 'static,
+    A2: Send + Sync + Debug + 'static,
     F: Fn(A1) -> Option<A2> + Send + Sync + Clone + 'static,
 {
     fn submit(&self, a: A1) {
