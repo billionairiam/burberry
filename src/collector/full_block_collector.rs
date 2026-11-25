@@ -1,7 +1,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use alloy::{providers::Provider, rpc::types::eth::Block};
+use alloy::{primitives::BlockHash, providers::Provider, rpc::types::eth::Block};
 use async_trait::async_trait;
 use futures::StreamExt;
 use tracing::{debug, error, warn};
@@ -41,25 +41,23 @@ impl FullBlockCollector {
         self
     }
 
-    /// Fetch the block body, retrying transient misses and RPC errors.
+    /// Fetch the exact block body identified by `block_hash`, retrying transient misses and RPC
+    /// errors.
     ///
-    /// Returns `None` once the retries are exhausted, in which case the block is skipped rather
-    /// than stalling the stream forever.
-    async fn fetch_full_block(&self, block_number: u64) -> Option<Block> {
+    /// Fetching by hash rather than by number prevents returning the wrong fork or duplicate
+    /// canonical blocks across a short reorg. Returns `None` once the retries are exhausted, in
+    /// which case the block is skipped rather than stalling the stream forever.
+    async fn fetch_full_block(&self, block_hash: BlockHash, block_number: u64) -> Option<Block> {
         for attempt in 0..=self.max_retries {
             let last_attempt = attempt == self.max_retries;
 
-            match self
-                .provider
-                .get_block_by_number(block_number.into())
-                .full()
-                .await
-            {
+            match self.provider.get_block_by_hash(block_hash).full().await {
                 Ok(Some(block)) => return Some(block),
                 Ok(None) => {
                     if last_attempt {
                         error!(
                             block = block_number,
+                            ?block_hash,
                             "block still not found after {} attempts, skipping it",
                             attempt + 1
                         );
@@ -68,12 +66,17 @@ impl FullBlockCollector {
 
                     // The node routinely announces a header slightly before it can serve the
                     // body, so an early miss is expected rather than noteworthy.
-                    debug!(block = block_number, "block not found yet, retrying");
+                    debug!(
+                        block = block_number,
+                        ?block_hash,
+                        "block not found yet, retrying"
+                    );
                 }
                 Err(e) => {
                     if last_attempt {
                         error!(
                             block = block_number,
+                            ?block_hash,
                             "fail to get full block after {} attempts, skipping it: {e:#}",
                             attempt + 1
                         );
@@ -82,6 +85,7 @@ impl FullBlockCollector {
 
                     warn!(
                         block = block_number,
+                        ?block_hash,
                         "fail to get full block, retrying: {e:#}"
                     );
                 }
@@ -107,7 +111,7 @@ impl Collector<Block> for FullBlockCollector {
 
         let stream = async_stream::stream! {
             while let Some(header) = stream.next().await {
-                if let Some(block) = self.fetch_full_block(header.number).await {
+                if let Some(block) = self.fetch_full_block(header.hash, header.number).await {
                     yield block;
                 }
             }
@@ -124,9 +128,10 @@ mod tests {
     use alloy::providers::ProviderBuilder;
     use alloy::transports::mock::Asserter;
 
-    fn block_at(number: u64) -> Block {
+    fn block_at(number: u64, hash_byte: u8) -> Block {
         let mut block: Block = Block::default();
         block.header.inner.number = number;
+        block.header.hash = BlockHash::repeat_byte(hash_byte);
         block
     }
 
@@ -142,14 +147,14 @@ mod tests {
         let asserter = Asserter::new();
         asserter.push_success(&Option::<Block>::None);
         asserter.push_success(&Option::<Block>::None);
-        asserter.push_success(&block_at(9));
+        asserter.push_success(&block_at(9, 0xaa));
 
         let collector = collector(&asserter, 5);
+        let hash = BlockHash::repeat_byte(0xaa);
 
-        assert_eq!(
-            collector.fetch_full_block(9).await.unwrap().header.number,
-            9
-        );
+        let block = collector.fetch_full_block(hash, 9).await.unwrap();
+        assert_eq!(block.header.number, 9);
+        assert_eq!(block.header.hash, hash);
         assert!(asserter.read_q().is_empty(), "should stop once it succeeds");
     }
 
@@ -157,15 +162,32 @@ mod tests {
     async fn retries_rpc_errors_too() {
         let asserter = Asserter::new();
         asserter.push_failure_msg("connection reset");
-        asserter.push_success(&block_at(9));
+        asserter.push_success(&block_at(9, 0xbb));
 
         let collector = collector(&asserter, 5);
+        let hash = BlockHash::repeat_byte(0xbb);
 
         // The previous implementation gave up on the first error and dropped the block.
-        assert_eq!(
-            collector.fetch_full_block(9).await.unwrap().header.number,
-            9
-        );
+        let block = collector.fetch_full_block(hash, 9).await.unwrap();
+        assert_eq!(block.header.number, 9);
+        assert_eq!(block.header.hash, hash);
+        assert!(asserter.read_q().is_empty());
+    }
+
+    #[tokio::test]
+    async fn fetches_distinct_hashes_at_same_height_on_reorg() {
+        let asserter = Asserter::new();
+        let hash_a = BlockHash::repeat_byte(0x01);
+        let hash_b = BlockHash::repeat_byte(0x02);
+        asserter.push_success(&block_at(10, 0x01));
+        asserter.push_success(&block_at(10, 0x02));
+
+        let collector = collector(&asserter, 2);
+
+        let first = collector.fetch_full_block(hash_a, 10).await.unwrap();
+        let second = collector.fetch_full_block(hash_b, 10).await.unwrap();
+        assert_eq!(first.header.hash, hash_a);
+        assert_eq!(second.header.hash, hash_b);
         assert!(asserter.read_q().is_empty());
     }
 
@@ -180,9 +202,12 @@ mod tests {
 
         // `max_retries = 3` means 4 attempts total, then the block is skipped. An unbounded retry
         // loop would keep going past the mock queue, so the timeout makes that a failure.
-        let result = tokio::time::timeout(Duration::from_secs(2), collector.fetch_full_block(9))
-            .await
-            .expect("fetch should give up rather than retry forever");
+        let result = tokio::time::timeout(
+            Duration::from_secs(2),
+            collector.fetch_full_block(BlockHash::repeat_byte(0xcc), 9),
+        )
+        .await
+        .expect("fetch should give up rather than retry forever");
 
         assert!(result.is_none());
         assert!(

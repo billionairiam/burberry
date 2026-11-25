@@ -2,6 +2,7 @@ use std::time::{Duration, Instant};
 
 use crate::types::{Collector, CollectorStream};
 use async_trait::async_trait;
+use tokio::time::MissedTickBehavior;
 
 pub struct IntervalCollector {
     interval: Duration,
@@ -20,9 +21,15 @@ impl Collector<Instant> for IntervalCollector {
     }
 
     async fn get_event_stream(&self) -> eyre::Result<CollectorStream<'_, Instant>> {
+        let mut ticker = tokio::time::interval(self.interval);
+        ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
+        // Consume the immediate first tick so the first event fires after `self.interval`,
+        // matching the previous sleep-then-yield timing without cumulative drift.
+        ticker.tick().await;
+
         let stream = async_stream::stream! {
             loop {
-                tokio::time::sleep(self.interval).await;
+                ticker.tick().await;
                 yield Instant::now();
             }
         };

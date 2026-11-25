@@ -24,3 +24,11 @@ telegram = ["dep:reqwest", "dep:serde_json", "tokio/net"]
 [dev-dependencies]
 tokio = { version = "1", features = ["full"] }
 futures = "0.3"
+
+[[example]]
+name = "map"
+required-features = ["ethereum"]
+
+[[example]]
+name = "subscribe_mempool"
+required-features = ["ethereum"]

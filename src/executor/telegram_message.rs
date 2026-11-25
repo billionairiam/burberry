@@ -1,3 +1,4 @@
+use std::fmt;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -7,7 +8,12 @@ use serde_json::{json, Map};
 
 use crate::types::Executor;
 
-#[derive(Debug, Clone)]
+const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+const DEFAULT_POOL_IDLE_TIMEOUT: Duration = Duration::from_secs(90);
+const ERROR_REPORT_TIMEOUT: Duration = Duration::from_secs(5);
+
+#[derive(Clone)]
 pub struct Message {
     pub bot_token: String,
     pub chat_id: String,
@@ -17,6 +23,21 @@ pub struct Message {
     pub protect_content: Option<bool>,
     pub disable_link_preview: Option<bool>,
     pub parse_mode: Option<String>,
+}
+
+impl fmt::Debug for Message {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Message")
+            .field("bot_token", &"[REDACTED]")
+            .field("chat_id", &self.chat_id)
+            .field("thread_id", &self.thread_id)
+            .field("text", &self.text)
+            .field("disable_notification", &self.disable_notification)
+            .field("protect_content", &self.protect_content)
+            .field("disable_link_preview", &self.disable_link_preview)
+            .field("parse_mode", &self.parse_mode)
+            .finish()
+    }
 }
 
 #[derive(Clone, Default)]
@@ -101,6 +122,16 @@ pub struct TelegramMessageDispatcher {
     client: reqwest::Client,
 }
 
+fn build_http_client(timeout: Duration) -> reqwest::Client {
+    reqwest::ClientBuilder::new()
+        // Without these, a stalled Telegram request blocks the executor forever.
+        .timeout(timeout)
+        .connect_timeout(timeout.min(DEFAULT_CONNECT_TIMEOUT))
+        .pool_idle_timeout(DEFAULT_POOL_IDLE_TIMEOUT)
+        .build()
+        .expect("failed to build reqwest client")
+}
+
 impl TelegramMessageDispatcher {
     pub fn new(
         error_report_bot_token: Option<String>,
@@ -112,13 +143,7 @@ impl TelegramMessageDispatcher {
             error_report_chat_id,
             error_report_thread_id,
             base_url: TELEGRAM_API_BASE_URL.to_string(),
-            client: reqwest::ClientBuilder::new()
-                // Without these, a stalled Telegram request blocks the executor forever.
-                .timeout(Duration::from_secs(30))
-                .connect_timeout(Duration::from_secs(10))
-                .pool_idle_timeout(Duration::from_secs(90))
-                .build()
-                .unwrap(),
+            client: build_http_client(DEFAULT_REQUEST_TIMEOUT),
         }
     }
 
@@ -133,11 +158,26 @@ impl TelegramMessageDispatcher {
         self
     }
 
+    /// Override the per-request HTTP timeout (defaults to 30s).
+    pub fn with_timeout(mut self, timeout: Duration) -> Self {
+        self.client = build_http_client(timeout);
+        self
+    }
+
     fn get_url<T: std::fmt::Display>(&self, bot_token: T) -> String {
         format!("{}/bot{}/sendMessage", self.base_url, bot_token)
     }
 
+    /// Send a Telegram message, logging and reporting API rejections as configured.
     pub async fn send_message(&self, message: &Message) {
+        if let Err(err) = self.try_send_message(message).await {
+            tracing::error!("fail to send message to telegram: {err:#}");
+        }
+    }
+
+    /// Fallible variant of [`Self::send_message`] used by the [`Executor`] implementation so the
+    /// engine can observe and account for failed deliveries.
+    pub async fn try_send_message(&self, message: &Message) -> eyre::Result<()> {
         let url = self.get_url(&message.bot_token);
 
         let mut data = Map::new();
@@ -146,10 +186,7 @@ impl TelegramMessageDispatcher {
         data.insert("text".to_string(), json!(&message.text));
         data.insert(
             "parse_mode".to_string(),
-            json!(&message
-                .parse_mode
-                .clone()
-                .unwrap_or("MarkdownV2".to_string())),
+            json!(message.parse_mode.as_deref().unwrap_or("MarkdownV2")),
         );
 
         if let Some(thread_id) = &message.thread_id {
@@ -179,11 +216,18 @@ impl TelegramMessageDispatcher {
         tracing::debug!("sending message to telegram: {data:?}");
 
         let response = self.client.post(&url).json(&data).send().await;
-        if let Err(err) = self.handle_response(response).await {
-            tracing::error!("fail to send message to telegram: {err:#}");
+        // Skip reporting errors back to Telegram when the transport itself failed (timeout /
+        // connection failure), otherwise a Telegram outage stalls each message twice as long.
+        let is_transport_failure = response.is_err();
 
-            self.report_error(message, format!("{err:#}")).await;
+        if let Err(err) = self.handle_response(response).await {
+            if !is_transport_failure {
+                self.report_error(message, format!("{err:#}")).await;
+            }
+            return Err(err);
         }
+
+        Ok(())
     }
 
     pub async fn report_error(&self, original_message: &Message, error_message: String) {
@@ -219,7 +263,13 @@ impl TelegramMessageDispatcher {
             )),
         );
 
-        let response = self.client.post(&url).json(&data).send().await;
+        let response = self
+            .client
+            .post(&url)
+            .timeout(ERROR_REPORT_TIMEOUT)
+            .json(&data)
+            .send()
+            .await;
         if let Err(err) = self.handle_response(response).await {
             tracing::error!("fail to send error report to telegram: {err:#}");
         }
@@ -232,7 +282,7 @@ impl TelegramMessageDispatcher {
                 let body = response
                     .text()
                     .await
-                    .unwrap_or("fail to read body".to_string());
+                    .unwrap_or_else(|_| "fail to read body".to_string());
 
                 eyre::bail!("response status: {status}, body: {body}");
             }
@@ -270,9 +320,7 @@ impl Executor<Message> for TelegramMessageDispatcher {
     async fn execute(&self, action: Arc<Message>) -> eyre::Result<()> {
         tracing::debug!("received message: {action:?}");
 
-        self.send_message(&action).await;
-
-        Ok(())
+        self.try_send_message(&action).await
     }
 }
 
@@ -290,4 +338,58 @@ pub fn escape(raw: &str) -> String {
         .collect();
 
     escaped_string
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use std::time::Instant;
+
+    #[test]
+    fn debug_redacts_bot_token() {
+        let msg = MessageBuilder::new()
+            .bot_token("123456:SUPER_SECRET_TOKEN")
+            .chat_id("42")
+            .text("hello")
+            .build();
+
+        let rendered = format!("{msg:?}");
+        assert!(
+            !rendered.contains("SUPER_SECRET_TOKEN"),
+            "bot_token must never appear in Debug output: {rendered}"
+        );
+        assert!(rendered.contains("[REDACTED]"));
+        assert!(rendered.contains("hello"));
+    }
+
+    #[tokio::test]
+    async fn transport_timeout_skips_redundant_error_report_roundtrip() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let base_url = format!("http://{}", listener.local_addr().unwrap());
+
+        let dispatcher = TelegramMessageDispatcher::new(
+            Some("error-bot-token".to_string()),
+            Some("error-chat".to_string()),
+            None,
+        )
+        .with_base_url(base_url)
+        .with_timeout(Duration::from_millis(120));
+
+        let msg = MessageBuilder::new()
+            .bot_token("token")
+            .chat_id("chat")
+            .text("hi")
+            .build();
+
+        let start = Instant::now();
+        let err = dispatcher.try_send_message(&msg).await.unwrap_err();
+        let elapsed = start.elapsed();
+
+        assert!(err.to_string().contains("failed to send message"));
+        assert!(
+            elapsed < Duration::from_secs(1),
+            "transport failure should not wait for a second error-report request, took {elapsed:?}"
+        );
+    }
 }

@@ -1,3 +1,8 @@
+use std::sync::{
+    atomic::{AtomicU64, Ordering},
+    Arc,
+};
+
 use tokio::sync::mpsc::{self, error::TrySendError, Sender};
 
 use crate::executor::telegram_message::{Message, TelegramMessageDispatcher};
@@ -10,33 +15,61 @@ const QUEUE_CAPACITY: usize = 1024;
 
 pub struct TelegramSubmitter {
     sender: Sender<Message>,
-
     redirect_to: Option<(String, String, Option<String>)>,
+    dropped: Arc<AtomicU64>,
 }
 
 impl TelegramSubmitter {
-    pub fn new_with_redirect(ot_token: String, chat_id: String, thread_id: Option<String>) -> Self {
-        Self {
-            sender: spawn_worker(TelegramMessageDispatcher::default()),
-            redirect_to: Some((ot_token, chat_id, thread_id)),
-        }
+    pub fn new_with_redirect(
+        bot_token: String,
+        chat_id: String,
+        thread_id: Option<String>,
+    ) -> Self {
+        Self::default().with_redirect(bot_token, chat_id, thread_id)
     }
 
     /// Send through the given dispatcher instead of a default one.
     pub fn with_dispatcher(dispatcher: TelegramMessageDispatcher) -> Self {
+        Self::with_dispatcher_and_capacity(dispatcher, QUEUE_CAPACITY)
+    }
+
+    /// Send through the given dispatcher using a custom bounded queue capacity.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `capacity` is 0.
+    pub fn with_dispatcher_and_capacity(
+        dispatcher: TelegramMessageDispatcher,
+        capacity: usize,
+    ) -> Self {
+        assert!(capacity > 0, "telegram queue capacity must be at least 1");
         Self {
-            sender: spawn_worker(dispatcher),
+            sender: spawn_worker(dispatcher, capacity),
             redirect_to: None,
+            dropped: Arc::new(AtomicU64::new(0)),
         }
+    }
+
+    /// Redirect all submitted messages to a single bot token / chat / optional topic thread.
+    pub fn with_redirect(
+        mut self,
+        bot_token: String,
+        chat_id: String,
+        thread_id: Option<String>,
+    ) -> Self {
+        self.redirect_to = Some((bot_token, chat_id, thread_id));
+        self
+    }
+
+    /// Total number of messages dropped because the queue was full or the worker stopped.
+    pub fn dropped_count(&self) -> u64 {
+        self.dropped.load(Ordering::Relaxed)
     }
 }
 
 impl Default for TelegramSubmitter {
     fn default() -> Self {
-        Self {
-            sender: spawn_worker(TelegramMessageDispatcher::default()),
-            redirect_to: None,
-        }
+        Self::with_dispatcher(TelegramMessageDispatcher::default())
     }
 }
 
@@ -58,9 +91,11 @@ impl ActionSubmitter<Message> for TelegramSubmitter {
         match self.sender.try_send(action) {
             Ok(()) => (),
             Err(TrySendError::Full(message)) => {
+                self.dropped.fetch_add(1, Ordering::Relaxed);
                 tracing::error!("telegram queue is full, dropping message: {message:?}")
             }
             Err(TrySendError::Closed(message)) => {
+                self.dropped.fetch_add(1, Ordering::Relaxed);
                 tracing::error!("telegram worker is gone, dropping message: {message:?}")
             }
         }
@@ -71,8 +106,8 @@ impl ActionSubmitter<Message> for TelegramSubmitter {
 ///
 /// A thread of its own keeps this working no matter how the caller is scheduled, including from
 /// outside any runtime, and it is created once for the submitter rather than once per message.
-fn spawn_worker(dispatcher: TelegramMessageDispatcher) -> Sender<Message> {
-    let (sender, mut receiver) = mpsc::channel::<Message>(QUEUE_CAPACITY);
+fn spawn_worker(dispatcher: TelegramMessageDispatcher, capacity: usize) -> Sender<Message> {
+    let (sender, mut receiver) = mpsc::channel::<Message>(capacity);
 
     let spawned = std::thread::Builder::new()
         .name("telegram-submitter".to_string())
@@ -129,7 +164,9 @@ mod tests {
         let base_url = format!("http://{}", listener.local_addr().unwrap());
 
         let submitter = TelegramSubmitter::with_dispatcher(
-            TelegramMessageDispatcher::default().with_base_url(base_url),
+            TelegramMessageDispatcher::default()
+                .with_base_url(base_url)
+                .with_timeout(Duration::from_millis(200)),
         );
 
         let start = Instant::now();
@@ -149,17 +186,28 @@ mod tests {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let base_url = format!("http://{}", listener.local_addr().unwrap());
 
-        let submitter = TelegramSubmitter::with_dispatcher(
-            TelegramMessageDispatcher::default().with_base_url(base_url),
-        );
+        let capacity = 32;
+        let submitter = TelegramSubmitter::with_dispatcher_and_capacity(
+            TelegramMessageDispatcher::default()
+                .with_base_url(base_url)
+                .with_timeout(Duration::from_millis(200)),
+            capacity,
+        )
+        .with_redirect("redirected".to_string(), "chat-2".to_string(), None);
 
         // The worker is stuck on the first message, so everything past the queue capacity is
         // dropped with an error rather than accumulating forever.
         let start = Instant::now();
-        for _ in 0..(QUEUE_CAPACITY * 2) {
+        let total = capacity * 3;
+        for _ in 0..total {
             submitter.submit(message());
         }
 
         assert!(start.elapsed() < Duration::from_secs(1));
+        assert!(
+            submitter.dropped_count() >= capacity as u64,
+            "expected saturated queue to drop excess messages, got {} drops",
+            submitter.dropped_count()
+        );
     }
 }

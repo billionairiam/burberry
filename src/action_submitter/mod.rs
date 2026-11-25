@@ -5,7 +5,7 @@ mod printer;
 mod telegram;
 
 use std::fmt::Debug;
-use std::sync::Arc;
+use std::sync::{atomic::Ordering, Arc};
 
 pub use map::ActionSubmitterMap;
 pub use printer::ActionPrinter;
@@ -15,16 +15,27 @@ pub use telegram::TelegramSubmitter;
 
 use tokio::sync::broadcast::Sender;
 
-use crate::ActionSubmitter;
+use crate::{engine::EngineStats, ActionSubmitter};
 
 #[derive(Clone)]
 pub struct ActionChannelSubmitter<A> {
     sender: Sender<Arc<A>>,
+    stats: Option<Arc<EngineStats>>,
 }
 
 impl<A> ActionChannelSubmitter<A> {
     pub fn new(sender: Sender<Arc<A>>) -> Self {
-        Self { sender }
+        Self {
+            sender,
+            stats: None,
+        }
+    }
+
+    pub(crate) fn with_stats(sender: Sender<Arc<A>>, stats: Arc<EngineStats>) -> Self {
+        Self {
+            sender,
+            stats: Some(stats),
+        }
     }
 }
 
@@ -34,7 +45,11 @@ where
 {
     fn submit(&self, action: A) {
         match self.sender.send(Arc::new(action)) {
-            Ok(_) => (),
+            Ok(_) => {
+                if let Some(stats) = &self.stats {
+                    stats.actions_submitted.fetch_add(1, Ordering::Relaxed);
+                }
+            }
             Err(e) => tracing::error!("error submitting action: {:?}", e),
         }
     }

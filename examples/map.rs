@@ -74,6 +74,7 @@ impl<T: Debug + Send + Sync> Executor<T> for EchoExecutor<T> {
 }
 
 #[derive(Debug, Clone)]
+#[allow(clippy::large_enum_variant)]
 enum Event {
     Block(Header),
     Transaction(Transaction),
